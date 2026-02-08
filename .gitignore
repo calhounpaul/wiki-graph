@@ -1,0 +1,29 @@
+# Data files (downloaded by setup.py, too large for git)
+data/extracted/
+data/pages/
+
+# Embeddings cache (rebuild with generate_graphs.py --rebuild)
+embeddings.db
+
+# Claude Code and Qwen model caches
+.claude/
+.qwen/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
