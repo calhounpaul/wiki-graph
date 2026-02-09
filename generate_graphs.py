@@ -117,6 +117,10 @@ def init_database(db_path: str):
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    # WAL mode for better write performance and reduced journal overhead
+    cursor.execute('PRAGMA journal_mode=WAL')
+    cursor.execute('PRAGMA synchronous=NORMAL')
+
     # Text embeddings table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS text_embeddings (
@@ -575,13 +579,12 @@ def load_cached_text_embedding(conn: sqlite3.Connection, filename: str, content_
 
 def save_text_embedding(conn: sqlite3.Connection, filename: str, title: str,
                         content_hash: str, embedding: np.ndarray, summary: str):
-    """Save text embedding to database."""
+    """Save text embedding to database (caller is responsible for committing)."""
     cursor = conn.cursor()
     cursor.execute('''
         INSERT OR REPLACE INTO text_embeddings (filename, title, content_hash, embedding, summary)
         VALUES (?, ?, ?, ?, ?)
     ''', (filename, title, content_hash, embedding.astype(np.float32).tobytes(), summary[:500]))
-    conn.commit()
 
 
 def generate_text_embeddings_with_cache(articles: List[Dict], model, conn: sqlite3.Connection,
@@ -633,7 +636,10 @@ def generate_text_embeddings_with_cache(articles: List[Dict], model, conn: sqlit
                     save_text_embedding(conn, article['filename'], article['title'],
                                        article['content_hash'], emb, article['summary'])
 
+                # Commit and clear CUDA cache every 50 batches (~200 embeddings)
                 if (batch_start // current_batch_size) % 50 == 0:
+                    conn.commit()
+                    torch.cuda.empty_cache()
                     print(f"  Generated {batch_end}/{len(texts)} text embeddings...")
 
                 batch_start = batch_end  # Move to next batch
@@ -641,6 +647,7 @@ def generate_text_embeddings_with_cache(articles: List[Dict], model, conn: sqlit
             except Exception as e:
                 error_str = str(e).lower()
                 if "cuda" in error_str or "gpu" in error_str or "device" in error_str:
+                    conn.commit()  # Save progress before exiting
                     print(f"\n  CUDA error at batch {batch_start}: {e}")
                     print(f"  GPU has crashed. Cannot recover without restart.")
                     print(f"  Progress saved: {cached_count + batch_start} embeddings cached.")
@@ -649,6 +656,7 @@ def generate_text_embeddings_with_cache(articles: List[Dict], model, conn: sqlit
                 else:
                     raise
 
+        conn.commit()  # Final commit for any remaining uncommitted rows
         print(f"  Saved {len(to_generate)} new text embeddings to database")
 
     return embeddings
@@ -728,7 +736,8 @@ def reduce_dimensions(embeddings: np.ndarray, n_components: int = 10,
 
 
 def cluster_hdbscan(embeddings: np.ndarray, min_cluster_size: int = 25,
-                    min_samples: int = None) -> Tuple[np.ndarray, Dict, int]:
+                    min_samples: int = None,
+                    cluster_selection_method: str = 'eom') -> Tuple[np.ndarray, Dict, int]:
     """Cluster using HDBSCAN with automatic cluster count discovery.
 
     HDBSCAN discovers the number of clusters from data density, handles
@@ -740,19 +749,22 @@ def cluster_hdbscan(embeddings: np.ndarray, min_cluster_size: int = 25,
         min_cluster_size: Smallest meaningful group size (auto-scaled if None)
         min_samples: Controls conservativeness; lower = less noise. Defaults to
                      min(min_cluster_size, 10).
+        cluster_selection_method: 'eom' (fewer large clusters) or 'leaf' (more
+                                  granular clusters). Use 'leaf' to break up
+                                  mega-clusters.
     """
     import hdbscan
 
     if min_samples is None:
         min_samples = min(min_cluster_size, 10)
 
-    print(f"Clustering with HDBSCAN (min_cluster_size={min_cluster_size}, min_samples={min_samples})...")
+    print(f"Clustering with HDBSCAN (min_cluster_size={min_cluster_size}, min_samples={min_samples}, method={cluster_selection_method})...")
 
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         metric='euclidean',
-        cluster_selection_method='eom',
+        cluster_selection_method=cluster_selection_method,
         prediction_data=True,
         core_dist_n_jobs=2
     )
@@ -1159,8 +1171,8 @@ def get_cluster_names_via_llm(articles: List[Dict], labels: np.ndarray, n_cluste
         prompt = f"""I have a cluster of {size} wiki articles from a wiki encyclopedia. Give this cluster a short, specific category name (2-5 words).
 
 RULES:
-- Reply with ONLY the category name on a single line
-- No quotes, no explanation, no markdown formatting
+- Reply with ONLY the category name on a single line, in English
+- No quotes, no explanation, no markdown formatting, no Chinese characters
 - Be SPECIFIC - do not use the wiki's general topic as a prefix (e.g. not "Star Trek X", just describe what makes this cluster unique)
 - The name should distinguish this cluster from the others
 {names_section}
@@ -1202,6 +1214,13 @@ Category name:"""
 
                 # Strip quotes
                 raw = raw.strip('"\'').strip()
+
+                # Reject non-English responses (Qwen3 sometimes outputs Chinese)
+                if not raw.isascii():
+                    if attempt < max_attempts - 1:
+                        continue  # retry
+                    # Last attempt: strip non-ASCII chars
+                    raw = ''.join(c for c in raw if c.isascii()).strip()
 
                 # Reject if too long (verbose/conversational response)
                 word_count = len(raw.split())
@@ -1795,7 +1814,8 @@ def save_cluster_report(articles: List[Dict], labels: np.ndarray,
                         cluster_keywords: Dict, link_graph: Dict, output_path: str,
                         wiki_name: str = "Wiki", cluster_names: Dict = None,
                         model_name: str = None, clustering_method: str = 'hdbscan',
-                        umap_dim: int = 10, cluster_metrics: Dict = None):
+                        umap_dim: int = 10, cluster_metrics: Dict = None,
+                        cluster_selection: str = None):
     """Save detailed cluster report as JSON."""
     print("Saving cluster report...")
 
@@ -1811,6 +1831,7 @@ def save_cluster_report(articles: List[Dict], labels: np.ndarray,
         'embedding_type': 'hybrid (text + graph)',
         'graph_embedding_dim': GRAPH_EMBEDDING_DIM,
         'clustering_method': clustering_method,
+        'cluster_selection_method': cluster_selection or ('eom' if clustering_method == 'hdbscan' else None),
         'umap_reduction_dim': umap_dim,
         'cluster_quality': cluster_metrics or {},
         'clusters': {}
@@ -1892,6 +1913,9 @@ Examples:
                         help='HDBSCAN min_cluster_size (default: auto-scaled by dataset size)')
     parser.add_argument('--min-samples', type=int, default=None,
                         help='HDBSCAN min_samples — lower = less noise (default: min(min_cluster_size, 10))')
+    parser.add_argument('--cluster-selection', type=str, default='eom',
+                        choices=['eom', 'leaf'],
+                        help='HDBSCAN cluster selection: eom (fewer large clusters) or leaf (more granular) (default: eom)')
     parser.add_argument('--semantic-threshold', type=float, default=0.5,
                         help='Cosine similarity threshold for semantic edges (default: 0.5)')
     parser.add_argument('--max-semantic-edges', type=int, default=10,
@@ -1994,7 +2018,8 @@ Examples:
         labels, cluster_info, n_clusters = cluster_hdbscan(
             reduced_embeddings,
             min_cluster_size=min_cs,
-            min_samples=args.min_samples
+            min_samples=args.min_samples,
+            cluster_selection_method=args.cluster_selection
         )
     else:
         n_clusters = min(args.clusters, len(articles) // 10)
@@ -2079,7 +2104,8 @@ Examples:
         model_name=model_name,
         clustering_method=args.clustering,
         umap_dim=args.umap_dim,
-        cluster_metrics=cluster_metrics
+        cluster_metrics=cluster_metrics,
+        cluster_selection=args.cluster_selection if args.clustering == 'hdbscan' else None
     )
 
     conn.close()

@@ -196,10 +196,26 @@ Current safe settings in generate_graphs.py:
 
 Full 59K-article run validated: ~90 min, peak 11.6GB RAM, no swap, system responsive throughout.
 
+## SQLite & GPU Stability (Critical for Large Datasets)
+
+The embedding pipeline writes 59K+ rows to SQLite and runs GPU inference for ~60 minutes. Two stability fixes are in place:
+
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| `sqlite3.OperationalError: database or disk is full` | Per-row `conn.commit()` in delete journal mode (59K commits = 59K journal file create/delete cycles) | WAL journal mode + batched commits every ~200 embeddings |
+| `CUDA error: unspecified launch failure` after ~30 min | VRAM fragmentation from sustained batch inference | `torch.cuda.empty_cache()` every ~200 embeddings |
+| Lost progress on GPU crash | `sys.exit(1)` without committing pending writes | Added `conn.commit()` in CUDA error handler before exit |
+
+SQLite settings in `init_database()`:
+- `PRAGMA journal_mode=WAL` -- append-only log instead of delete journal
+- `PRAGMA synchronous=NORMAL` -- safe with WAL, reduces fsync overhead
+
+If a CUDA crash occurs, the script saves progress and exits. Re-running picks up from cache automatically.
+
 ## Performance Notes
 
 - Default run with no `--limit` processes ALL articles (~59K for Memory Alpha)
-- Embeddings are cached in SQLite, so re-runs only regenerate graph embeddings + visualizations
+- Embeddings are cached in SQLite (WAL mode), so re-runs only regenerate missing embeddings + graph embeddings + visualizations
 - HDBSCAN with auto-scaled `min_cluster_size` adapts to dataset size: `max(5, len(articles) // 200)`
 - Full 59K articles: ~90 min (CPU-safe mode), peak 11.6GB RAM, no swap
 - Breakdown: node2vec ~35 min, spring_layout ~40 min, everything else ~15 min
