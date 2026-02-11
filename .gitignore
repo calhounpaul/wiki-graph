@@ -5,6 +5,9 @@ data/pages/
 # Embeddings cache (rebuild with generate_graphs.py --rebuild)
 embeddings.db
 
+# Viz cache (intermediate state for fast re-rendering, ~400MB)
+*_viz_cache.pkl
+
 # Claude Code and Qwen model caches
 .claude/
 .qwen/

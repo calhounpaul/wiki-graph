@@ -1266,14 +1266,19 @@ Category name:"""
 
 def create_network_graph(articles: List[Dict], embeddings: np.ndarray, labels: np.ndarray,
                          cluster_keywords: Dict, link_graph: Dict[str, Set[str]], output_path: str,
-                         wiki_name: str = "Wiki", similarity_threshold: float = 0.5,
-                         top_k: int = 5, cluster_names: Dict = None):
-    """Create network graph using actual wiki links + semantic similarity."""
+                         wiki_name: str = "Wiki", cluster_names: Dict = None,
+                         umap_coords: np.ndarray = None):
+    """Create network graph using UMAP semantic layout with wiki link backbone edges.
+
+    Uses UMAP 2D positions for semantically meaningful node placement, then overlays
+    a filtered backbone of wiki links (hub connections + inter-cluster bridges).
+    """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import networkx as nx
+    from adjustText import adjust_text
 
-    print("Creating network graph (using wiki links + semantic similarity)...")
+    print("Creating network graph (UMAP layout + wiki link backbone)...")
     n = len(articles)
     title_to_idx = {a['title']: i for i, a in enumerate(articles)}
 
@@ -1285,11 +1290,11 @@ def create_network_graph(articles: List[Dict], embeddings: np.ndarray, labels: n
 
     for i, article in enumerate(articles):
         G.add_node(i,
-                   title=article['title'][:30],
+                   title=article['title'][:35],
                    cluster=int(labels[i]),
                    color=cluster_to_color[labels[i]])
 
-    # Add edges from wiki links (real relationships)
+    # Add edges from wiki links
     link_edges = 0
     for source_title, targets in link_graph.items():
         if source_title in title_to_idx:
@@ -1301,102 +1306,205 @@ def create_network_graph(articles: List[Dict], embeddings: np.ndarray, labels: n
                         G.add_edge(source_idx, target_idx, weight=1.0, edge_type='link')
                         link_edges += 1
 
-    print(f"  Added {link_edges} edges from wiki links")
-    print(f"  Graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+    print(f"  {link_edges:,} wiki link edges")
 
-    # Visualization
-    fig_size = (40, 35) if n > 1000 else (32, 28)
+    # --- Layout: UMAP 2D positions ---
+    if umap_coords is not None:
+        print("  Using precomputed UMAP 2D positions")
+        coords = umap_coords
+    else:
+        print("  Computing UMAP 2D positions...")
+        try:
+            from umap import UMAP
+            n_neighbors = min(30, n - 1)
+            reducer = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1,
+                          random_state=42, metric='cosine', n_jobs=2)
+            coords = reducer.fit_transform(embeddings)
+        except ImportError:
+            print("  ERROR: UMAP required for network graph layout")
+            return
+
+    pos = {i: (float(coords[i, 0]), float(coords[i, 1])) for i in range(n)}
+
+    # --- Hub identification via PageRank ---
+    print("  Computing PageRank...")
+    pagerank = nx.pagerank(G, max_iter=50, tol=1e-4)
+    degrees = dict(G.degree())
+
+    n_hubs = max(30, min(150, n // 500))
+    sorted_by_pr = sorted(pagerank.keys(), key=lambda x: pagerank[x], reverse=True)
+    hub_nodes = set(sorted_by_pr[:n_hubs])
+
+    # --- Edge filtering: sparse backbone ---
+    # For each hub, keep only its top-K edges by endpoint PageRank (avoids fan-out)
+    # Plus a sample of inter-cluster bridge edges
+    edges_per_hub = 10 if n > 10000 else (15 if n > 1000 else 20)
+    hub_edge_set = set()
+    for hub_nd in hub_nodes:
+        # Get all neighbors, sort by their PageRank, keep top-K
+        neighbors = list(G.neighbors(hub_nd))
+        neighbors.sort(key=lambda x: pagerank.get(x, 0), reverse=True)
+        for nbr in neighbors[:edges_per_hub]:
+            edge = (min(hub_nd, nbr), max(hub_nd, nbr))
+            hub_edge_set.add(edge)
+    hub_edges = list(hub_edge_set)
+
+    inter_cluster_edges = []
+    for u, v in G.edges():
+        if labels[u] != labels[v] and u not in hub_nodes and v not in hub_nodes:
+            inter_cluster_edges.append((u, v))
+
+    # Sample inter-cluster edges (fewer for large datasets)
+    max_inter = 3000 if n > 20000 else (8000 if n > 5000 else 15000)
+    max_inter = min(max_inter, len(inter_cluster_edges))
+    if len(inter_cluster_edges) > max_inter:
+        rng = np.random.RandomState(42)
+        sampled = rng.choice(len(inter_cluster_edges), max_inter, replace=False)
+        inter_cluster_edges = [inter_cluster_edges[i] for i in sampled]
+
+    total_drawn = len(hub_edges) + len(inter_cluster_edges)
+    print(f"  Drawing {total_drawn:,} backbone edges ({len(hub_edges):,} hub + "
+          f"{len(inter_cluster_edges):,} inter-cluster) of {link_edges:,} total")
+
+    # --- Adaptive visual parameters based on dataset size ---
+    if n > 20000:
+        fig_size = (42, 36)
+        base_size, hub_base = 8, 50
+        reg_alpha, hub_alpha = 0.55, 0.9
+        ic_alpha, he_alpha = 0.02, 0.06
+        ic_width, he_width = 0.15, 0.3
+        cent_fs, hub_fs = 6, 5
+        top_hub_count = 50
+    elif n > 5000:
+        fig_size = (38, 32)
+        base_size, hub_base = 10, 55
+        reg_alpha, hub_alpha = 0.6, 0.9
+        ic_alpha, he_alpha = 0.03, 0.08
+        ic_width, he_width = 0.2, 0.35
+        cent_fs, hub_fs = 7, 6
+        top_hub_count = 40
+    elif n > 1000:
+        fig_size = (36, 30)
+        base_size, hub_base = 12, 60
+        reg_alpha, hub_alpha = 0.65, 0.9
+        ic_alpha, he_alpha = 0.05, 0.12
+        ic_width, he_width = 0.25, 0.45
+        cent_fs, hub_fs = 8, 7
+        top_hub_count = 30
+    else:
+        fig_size = (32, 28)
+        base_size, hub_base = 25, 90
+        reg_alpha, hub_alpha = 0.7, 0.9
+        ic_alpha, he_alpha = 0.1, 0.2
+        ic_width, he_width = 0.4, 0.6
+        cent_fs, hub_fs = 9, 8
+        top_hub_count = 20
+
     fig, ax = plt.subplots(figsize=fig_size)
 
-    print("  Computing cluster-aware layout...")
+    # Draw inter-cluster edges (subtle grey bridges)
+    if inter_cluster_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=inter_cluster_edges,
+                              alpha=ic_alpha, width=ic_width, edge_color='#999999', ax=ax)
 
-    # Use cluster-aware initial positions to get good separation
-    import random as _random
-    _random.seed(42)
-    np.random.seed(42)
+    # Draw hub edges (colored by hub node's cluster)
+    if hub_edges:
+        hub_edge_colors = []
+        for u, v in hub_edges:
+            hub_nd = u if u in hub_nodes else v
+            c = colors[labels[hub_nd]]
+            hub_edge_colors.append(c[:3] if len(c) > 3 else c)
+        nx.draw_networkx_edges(G, pos, edgelist=hub_edges,
+                              alpha=he_alpha, width=he_width, edge_color=hub_edge_colors, ax=ax)
 
-    # Place cluster centers on a circle, then jitter nodes around their center
-    # Use large radius and tight jitter to keep clusters well-separated
-    circle_radius = 20 if n > 1000 else 15
-    jitter = 3.0 if n > 1000 else 2.5
-    initial_pos = {}
-    for cluster_id in range(n_clusters):
-        angle = 2 * np.pi * cluster_id / n_clusters
-        center_x = circle_radius * np.cos(angle)
-        center_y = circle_radius * np.sin(angle)
-        cluster_nodes = [i for i in range(n) if labels[i] == cluster_id]
-        for node in cluster_nodes:
-            initial_pos[node] = np.array([
-                center_x + np.random.randn() * jitter,
-                center_y + np.random.randn() * jitter
-            ])
+    # --- Draw nodes (two layers: regular then hubs on top) ---
+    node_size_dict = {}
+    for nd in G.nodes():
+        deg = degrees.get(nd, 0)
+        if nd in hub_nodes:
+            node_size_dict[nd] = hub_base + np.log1p(deg) * hub_base * 0.3
+        else:
+            node_size_dict[nd] = max(base_size * 0.5, base_size + np.log1p(deg) * base_size * 0.4)
 
-    # Spring layout: high k = strong repulsion to preserve cluster separation
-    # Few iterations so layout refines edges without collapsing clusters together
-    k_val = 5.0 if n > 1000 else 3.5
-    iters = 15 if n > 5000 else (40 if n > 1000 else 60)
-    pos = nx.spring_layout(G, pos=initial_pos, k=k_val, iterations=iters, seed=42, scale=20)
+    # Regular nodes (subtle, no border)
+    regular_nodes = [nd for nd in G.nodes() if nd not in hub_nodes]
+    if regular_nodes:
+        nx.draw_networkx_nodes(G, pos, nodelist=regular_nodes,
+                              node_color=[G.nodes[nd]['color'] for nd in regular_nodes],
+                              node_size=[node_size_dict[nd] for nd in regular_nodes],
+                              alpha=reg_alpha, ax=ax, edgecolors='none', linewidths=0)
 
-    # Draw edges with adaptive alpha based on graph density
-    edges = G.edges(data=True)
-    link_edge_list = [(u, v) for u, v, d in edges if d.get('edge_type') == 'link']
-    semantic_edge_list = [(u, v) for u, v, d in edges if d.get('edge_type') == 'semantic']
+    # Hub nodes on top (prominent, with white border)
+    hub_node_list = sorted(hub_nodes, key=lambda x: pagerank[x])
+    if hub_node_list:
+        nx.draw_networkx_nodes(G, pos, nodelist=hub_node_list,
+                              node_color=[G.nodes[nd]['color'] for nd in hub_node_list],
+                              node_size=[node_size_dict[nd] for nd in hub_node_list],
+                              alpha=hub_alpha, ax=ax, edgecolors='white', linewidths=0.5)
 
-    edge_alpha = 0.04 if n > 1000 else (0.08 if n > 500 else 0.15)
-    edge_width = 0.2 if n > 1000 else 0.4
+    # --- Centroid labels for top clusters ---
+    max_centroid_labels = 30 if n_clusters > 40 else n_clusters
+    sorted_clusters = sorted(range(n_clusters), key=lambda c: np.sum(labels == c), reverse=True)
 
-    # Draw link edges
-    if link_edge_list:
-        nx.draw_networkx_edges(G, pos, edgelist=link_edge_list, alpha=edge_alpha,
-                              width=edge_width, edge_color='#888888', ax=ax)
+    for cluster_id in sorted_clusters[:max_centroid_labels]:
+        cluster_mask = labels == cluster_id
+        if cluster_mask.sum() == 0:
+            continue
+        cluster_coords = coords[cluster_mask]
+        centroid = cluster_coords.mean(axis=0)
+        if cluster_names and cluster_id in cluster_names:
+            label_text = cluster_names[cluster_id]
+        else:
+            label_text = f"C{cluster_id}: {', '.join(cluster_keywords.get(cluster_id, [])[:2])}"
+        c = colors[cluster_id]
+        edge_c = c[:3] if len(c) > 3 else c
+        ax.annotate(label_text, xy=centroid, fontsize=cent_fs, fontweight='bold',
+                   ha='center', va='center', zorder=1000,
+                   bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                            edgecolor=edge_c, alpha=0.85, linewidth=1.5))
 
-    # Draw semantic edges (even more subtle)
-    if semantic_edge_list:
-        nx.draw_networkx_edges(G, pos, edgelist=semantic_edge_list,
-                              alpha=edge_alpha * 0.3, width=edge_width * 0.5,
-                              edge_color='#aaccee', ax=ax)
+    # --- Hub node labels with adjustText ---
+    top_hub_count = min(top_hub_count, n_hubs // 2)
+    top_hubs = sorted_by_pr[:top_hub_count]
 
-    node_colors = [G.nodes[nd]['color'] for nd in G.nodes()]
-    node_sizes = [25 + G.degree(nd) * 2 for nd in G.nodes()]
-    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes,
-                          alpha=0.75, ax=ax, edgecolors='white', linewidths=0.3)
+    hub_texts = []
+    for nd in top_hubs:
+        t = ax.text(pos[nd][0], pos[nd][1], G.nodes[nd]['title'],
+                   fontsize=hub_fs, fontweight='bold', alpha=0.85, zorder=999,
+                   bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                            edgecolor='#cccccc', alpha=0.7, linewidth=0.5))
+        hub_texts.append(t)
 
-    # Label only top hub nodes (top 1% by degree, max 60)
-    degrees = dict(G.degree())
-    degree_threshold = np.percentile(list(degrees.values()), 99) if degrees else 5
-    degree_threshold = max(degree_threshold, 3)
+    if hub_texts:
+        print(f"  Adjusting {len(hub_texts)} hub labels...")
+        adjust_text(hub_texts, ax=ax,
+                   arrowprops=dict(arrowstyle='->', color='gray', lw=0.3, alpha=0.3),
+                   force_points=(0.3, 0.3), force_text=(0.5, 0.5),
+                   expand_points=(1.2, 1.2), lim=200)
 
-    labels_dict = {nd: G.nodes[nd]['title'] for nd in G.nodes() if degrees[nd] >= degree_threshold}
-    max_labels = 60 if n > 1000 else 80
-    if len(labels_dict) > max_labels:
-        sorted_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:max_labels]
-        labels_dict = {nd: G.nodes[nd]['title'] for nd, d in sorted_nodes}
-
-    if labels_dict:
-        nx.draw_networkx_labels(G, pos, labels_dict, font_size=9, font_weight='bold',
-                               font_color='#222222', ax=ax,
-                               bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                                        edgecolor='#aaaaaa', alpha=0.85))
-
-    # Legend with better formatting
+    # --- Compact legend (top 25 clusters) ---
     legend_patches = []
-    sorted_cluster_ids = sorted(cluster_keywords.keys(),
-                                key=lambda c: np.sum(labels == c), reverse=True)
-    for cluster_id in sorted_cluster_ids:
+    max_legend = 25 if n_clusters > 30 else n_clusters
+    for cluster_id in sorted_clusters[:max_legend]:
         size = int(np.sum(labels == cluster_id))
         if cluster_names and cluster_id in cluster_names:
-            label = f"C{cluster_id}: {cluster_names[cluster_id]} ({size})"
+            label = f"{cluster_names[cluster_id]} ({size})"
         else:
             kw = ', '.join(cluster_keywords[cluster_id][:3])
             label = f"C{cluster_id}: {kw} ({size})"
         legend_patches.append(mpatches.Patch(color=cluster_to_color[cluster_id], label=label))
 
-    ncol = 2 if n_clusters <= 20 else 3
-    ax.legend(handles=legend_patches, loc='upper left', fontsize=10, ncol=ncol,
+    if n_clusters > max_legend:
+        legend_patches.append(mpatches.Patch(
+            color='#cccccc', label=f"... and {n_clusters - max_legend} more clusters"))
+
+    ncol = 2 if max_legend <= 15 else 3
+    ax.legend(handles=legend_patches, loc='upper left', fontsize=max(6, cent_fs - 1), ncol=ncol,
              framealpha=0.95, edgecolor='#999999', fancybox=True,
-             borderpad=1.0, handlelength=1.5)
-    ax.set_title(f'{wiki_name} Semantic Network\n'
-                 f'{n} Articles, {n_clusters} Clusters, {link_edges} Wiki Links',
+             borderpad=0.8, handlelength=1.2)
+
+    ax.set_title(f'{wiki_name} Wiki Link Network\n'
+                 f'{n:,} Articles, {n_clusters} Clusters, {link_edges:,} Wiki Links',
                  fontsize=16, fontweight='bold', pad=20)
     ax.axis('off')
 
@@ -1404,6 +1512,123 @@ def create_network_graph(articles: List[Dict], embeddings: np.ndarray, labels: n
     plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"  Saved network graph to {output_path}")
+
+
+def create_cluster_network(articles: List[Dict], labels: np.ndarray,
+                           cluster_keywords: Dict, link_graph: Dict[str, Set[str]],
+                           output_path: str, wiki_name: str = "Wiki",
+                           cluster_names: Dict = None):
+    """Create macro-level network showing relationships between topic clusters.
+
+    Each cluster becomes a node (sized by article count), edges represent
+    inter-cluster wiki link counts. Shows high-level wiki topic structure.
+    """
+    import matplotlib.pyplot as plt
+    import networkx as nx
+
+    print("Creating cluster relationship network...")
+    n_clusters = len(set(labels))
+    title_to_idx = {a['title']: i for i, a in enumerate(articles)}
+    colors = generate_distinct_colors(n_clusters)
+
+    CG = nx.Graph()
+    cluster_sizes = {}
+    for cid in range(n_clusters):
+        size = int(np.sum(labels == cid))
+        cluster_sizes[cid] = size
+        name = cluster_names[cid] if cluster_names and cid in cluster_names else f"Cluster {cid}"
+        CG.add_node(cid, size=size, name=name, color=colors[cid])
+
+    # Count inter-cluster wiki links
+    edge_weights = {}
+    for source_title, targets in link_graph.items():
+        if source_title in title_to_idx:
+            src_idx = title_to_idx[source_title]
+            src_cluster = int(labels[src_idx])
+            for target_title in targets:
+                if target_title in title_to_idx:
+                    tgt_idx = title_to_idx[target_title]
+                    tgt_cluster = int(labels[tgt_idx])
+                    if src_cluster != tgt_cluster:
+                        pair = (min(src_cluster, tgt_cluster), max(src_cluster, tgt_cluster))
+                        edge_weights[pair] = edge_weights.get(pair, 0) + 1
+
+    for (c1, c2), weight in edge_weights.items():
+        CG.add_edge(c1, c2, weight=weight)
+
+    total_cross_links = sum(edge_weights.values())
+    print(f"  {n_clusters} cluster nodes, {len(edge_weights)} edges, "
+          f"{total_cross_links:,} cross-topic links")
+
+    # Filter weak edges for visual clarity
+    if len(edge_weights) > 100:
+        # More aggressive filtering for larger cluster counts
+        pct = 75 if n_clusters > 80 else (60 if n_clusters > 40 else 50)
+        threshold = np.percentile(list(edge_weights.values()), pct)
+        weak_edges = [(c1, c2) for (c1, c2), w in edge_weights.items() if w < threshold]
+        CG.remove_edges_from(weak_edges)
+        print(f"  Filtered to {CG.number_of_edges()} significant edges (p{pct}, threshold={threshold})")
+
+    # Layout: Kamada-Kawai for balanced spread, spring as fallback
+    try:
+        pos = nx.kamada_kawai_layout(CG, weight='weight', scale=10)
+    except Exception:
+        pos = nx.spring_layout(CG, k=2.5, iterations=200, seed=42, weight='weight', scale=10)
+
+    # Node sizes: sqrt-scaled by cluster size
+    max_size = max(cluster_sizes.values()) if cluster_sizes else 1
+    node_sizes = [max(400, np.sqrt(CG.nodes[nd]['size'] / max_size) * 6000)
+                  for nd in CG.nodes()]
+
+    # Edge widths: log-scaled by weight
+    edge_weights_list = [CG[u][v]['weight'] for u, v in CG.edges()]
+
+    fig_w = 44 if n_clusters > 80 else (36 if n_clusters > 50 else 30)
+    fig_h = 38 if n_clusters > 80 else (32 if n_clusters > 50 else 26)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    node_colors = [CG.nodes[nd]['color'] for nd in CG.nodes()]
+
+    if edge_weights_list:
+        max_w = max(edge_weights_list)
+        edge_widths = [max(0.3, np.log1p(w) / np.log1p(max_w) * 6)
+                       for w in edge_weights_list]
+        edge_alphas = [min(0.5, max(0.05, w / max_w)) for w in edge_weights_list]
+        # Draw edges with varying alpha by weight
+        for (u, v), width, alpha in zip(CG.edges(), edge_widths, edge_alphas):
+            nx.draw_networkx_edges(CG, pos, edgelist=[(u, v)],
+                                  alpha=alpha * 0.4, width=width,
+                                  edge_color='#555555', ax=ax)
+
+    nx.draw_networkx_nodes(CG, pos, node_color=node_colors, node_size=node_sizes,
+                          alpha=0.85, ax=ax, edgecolors='white', linewidths=2)
+
+    # Labels: cluster name + article count
+    label_fs = 7 if n_clusters <= 40 else (6 if n_clusters <= 80 else 5)
+    labels_dict = {}
+    for nd in CG.nodes():
+        name = CG.nodes[nd]['name']
+        size = CG.nodes[nd]['size']
+        # Wrap long names
+        if len(name) > 20:
+            words = name.split()
+            mid = len(words) // 2
+            name = ' '.join(words[:mid]) + '\n' + ' '.join(words[mid:])
+        labels_dict[nd] = f"{name}\n({size})"
+
+    nx.draw_networkx_labels(CG, pos, labels_dict, font_size=label_fs, font_weight='bold',
+                           font_color='#222222', ax=ax,
+                           bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                                    edgecolor='#aaaaaa', alpha=0.85))
+
+    ax.set_title(f'{wiki_name} Cluster Relationship Network\n'
+                 f'{n_clusters} Topic Clusters, {total_cross_links:,} Cross-Topic Links',
+                 fontsize=18, fontweight='bold', pad=20)
+    ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  Saved cluster network to {output_path}")
 
 
 def _label_cluster_centroids(ax, coords, labels, articles, cluster_keywords,
@@ -1517,24 +1742,27 @@ def create_tsne_plot(articles: List[Dict], embeddings: np.ndarray, labels: np.nd
 
 def create_umap_plot(articles: List[Dict], embeddings: np.ndarray, labels: np.ndarray,
                      cluster_keywords: Dict, output_path: str, wiki_name: str = "Wiki",
-                     cluster_names: Dict = None):
+                     cluster_names: Dict = None, umap_coords: np.ndarray = None):
     """Create UMAP 2D visualization."""
-    try:
-        from umap import UMAP
-    except ImportError:
-        print("  Skipping UMAP (not installed - run: pip install umap-learn)")
-        return
-
     import matplotlib.pyplot as plt
 
     n = len(articles)
     print(f"Creating UMAP visualization ({n} articles)...")
 
-    n_neighbors = min(30, n - 1)
-    print(f"  Running UMAP with n_neighbors={n_neighbors}...")
-    reducer = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42,
-                   metric='cosine', n_jobs=2)
-    coords = reducer.fit_transform(embeddings)
+    if umap_coords is not None:
+        print("  Using precomputed UMAP 2D coordinates")
+        coords = umap_coords
+    else:
+        try:
+            from umap import UMAP
+        except ImportError:
+            print("  Skipping UMAP (not installed - run: pip install umap-learn)")
+            return
+        n_neighbors = min(30, n - 1)
+        print(f"  Running UMAP with n_neighbors={n_neighbors}...")
+        reducer = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42,
+                       metric='cosine', n_jobs=2)
+        coords = reducer.fit_transform(embeddings)
 
     fig, ax = plt.subplots(figsize=(26, 22))
 
@@ -2049,15 +2277,42 @@ Examples:
         print("\n11. Generating cluster names via LLM...")
         cluster_names = get_cluster_names_via_llm(articles, labels, n_clusters)
 
+    # Save viz state for fast re-rendering (load with pickle.load)
+    import pickle
+    viz_cache = os.path.join(args.output_dir, f"{file_prefix}_viz_cache.pkl")
+    with open(viz_cache, 'wb') as f:
+        pickle.dump({
+            'articles': articles, 'combined_embeddings': combined_embeddings,
+            'labels': labels, 'cluster_keywords': cluster_keywords,
+            'link_graph': link_graph, 'cluster_names': cluster_names,
+            'n_clusters': n_clusters, 'cluster_metrics': cluster_metrics,
+        }, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"\n  Saved viz cache ({os.path.getsize(viz_cache) / 1024 / 1024:.0f} MB)")
+
     # Create visualizations
     print("\n12. Creating visualizations...")
+
+    # Compute shared UMAP 2D projection (reused by network graph and UMAP scatter)
+    print("  Computing shared UMAP 2D projection...")
+    from umap import UMAP as UMAP_viz
+    umap_n_neighbors = min(30, len(articles) - 1)
+    umap_2d_reducer = UMAP_viz(n_components=2, n_neighbors=umap_n_neighbors, min_dist=0.1,
+                                random_state=42, metric='cosine', n_jobs=2)
+    umap_coords = umap_2d_reducer.fit_transform(combined_embeddings)
+    print(f"  UMAP 2D projection: {umap_coords.shape}")
 
     create_network_graph(
         articles, combined_embeddings, labels, cluster_keywords, link_graph,
         os.path.join(args.output_dir, f"{file_prefix}_network_graph.png"),
         wiki_name=args.wiki_name,
-        similarity_threshold=0.45,
-        top_k=5,
+        cluster_names=cluster_names,
+        umap_coords=umap_coords
+    )
+
+    create_cluster_network(
+        articles, labels, cluster_keywords, link_graph,
+        os.path.join(args.output_dir, f"{file_prefix}_cluster_network.png"),
+        wiki_name=args.wiki_name,
         cluster_names=cluster_names
     )
 
@@ -2072,7 +2327,8 @@ Examples:
         articles, combined_embeddings, labels, cluster_keywords,
         os.path.join(args.output_dir, f"{file_prefix}_umap_scatter.png"),
         wiki_name=args.wiki_name,
-        cluster_names=cluster_names
+        cluster_names=cluster_names,
+        umap_coords=umap_coords
     )
 
     create_similarity_heatmap(

@@ -25,11 +25,12 @@ Requires: `wget`, `p7zip-full` (`sudo apt install p7zip-full`)
 ### Generate Visualizations
 
 ```bash
-python generate_graphs.py                           # Full run (HDBSCAN, auto cluster count)
+python generate_graphs.py                           # Full run (HDBSCAN eom, auto cluster count)
 python generate_graphs.py --test                    # Quick test (100 articles)
 python generate_graphs.py --limit 500               # Limit to 500 articles
 python generate_graphs.py --clustering kmeans --clusters 30  # K-Means with 30 clusters
-python generate_graphs.py --min-cluster-size 50     # HDBSCAN with larger clusters
+python generate_graphs.py --min-cluster-size 50     # HDBSCAN with smaller min cluster size
+python generate_graphs.py --cluster-selection leaf   # Granular clusters (breaks up mega-clusters)
 python generate_graphs.py --umap-dim 5              # 5D UMAP reduction before clustering
 python generate_graphs.py --wiki-name "Memory Alpha" # Custom name for titles/filenames
 python generate_graphs.py --name-clusters           # Use LLM for cluster names (requires Ollama)
@@ -104,6 +105,8 @@ The pipeline follows best practices from semantic clustering research:
 
 1. **UMAP reduction** (10D default) -- clustering in reduced space significantly outperforms raw high-dimensional clustering
 2. **HDBSCAN** (default) -- auto-discovers cluster count from data density, labels noise points, reassigns them to nearest centroid
+   - `--cluster-selection eom` (default): Fewer, larger clusters. "Excess of mass" merges sub-clusters. 59K articles -> ~15 clusters (one 70% mega-cluster)
+   - `--cluster-selection leaf`: More granular clusters at the leaves of the condensed tree. 59K articles -> ~108 clusters (largest 3.4%), much better topic separation
 3. **K-Means** (alternative via `--clustering kmeans`) -- requires specifying cluster count, assigns all documents
 4. **Quality metrics** -- silhouette score (>0.5 good), Calinski-Harabasz (higher better), Davies-Bouldin (lower better)
 5. **Visualization** -- scatter plots use separate 2D projections from full embeddings (not the 10D reduced space)
@@ -169,9 +172,10 @@ Only main namespace (ns=0) articles are extracted. Redirects and short articles 
 - Enabled via `--name-clusters` flag, requires Ollama running with `qwen3:8b`
 - Ollama runs qwen3:8b on GPU locally (CUDA) -- no cloud API calls
 - **Critical**: Uses `think=False` in `ollama.chat()` -- without it, Qwen3 spends all tokens on internal thinking and returns empty `content`
+- **Critical**: Qwen3 sometimes outputs Chinese characters instead of English -- prompt explicitly says "in English, no Chinese characters" and code rejects non-ASCII responses via `raw.isascii()` with retry; last attempt strips non-ASCII chars
 - Growing names list: clusters processed largest-first, each prompt includes all previously assigned names to prevent duplicates
 - Context per cluster: TF-IDF top 30 distinctive words + 15 sample articles with title and content snippet (~200 chars each)
-- Retry logic (3 attempts) handles verbose responses, duplicates, and empty results
+- Retry logic (3 attempts) handles verbose responses, duplicates, empty results, and non-English responses
 - Prompt instructs model to avoid using the wiki's general topic as prefix
 
 ## CPU Safety (Critical for Large Datasets)
